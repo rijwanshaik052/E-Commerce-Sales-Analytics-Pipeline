@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:15
+    container_name: ecommerce_postgres
+    environment:
+      POSTGRES_USER: rijwan
+      POSTGRES_PASSWORD: rijwan123
+      POSTGRES_DB: olist_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pipeline:
+    build: .
+    container_name: ecommerce_pipeline
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: olist_db
+      DB_USER: rijwan
+      DB_PASSWORD: rijwan123
+    command: python3 src/pipeline.py
+
+volumes:
+  postgres_data:
