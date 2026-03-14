@@ -8,10 +8,16 @@ CREATE TABLE IF NOT EXISTS metadata.pipeline_runs (
 );
 
 CREATE TABLE IF NOT EXISTS metadata.file_ingestion_logs (
-    id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     file_name TEXT,
-    load_time TIMESTAMP,
-    records_loaded INT,
-    records_failed INT,
-    status TEXT
+    file_hash TEXT,
+    file_size BIGINT,
+    status TEXT,
+    ingestion_time TIMESTAMP,
+    row_count INT,
+    error_message TEXT
 );
+
+ALTER TABLE metadata.file_ingestion_logs
+ADD CONSTRAINT unique_file_hash UNIQUE (file_hash);
+
