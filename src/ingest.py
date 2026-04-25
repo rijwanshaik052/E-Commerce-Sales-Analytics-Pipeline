@@ -1,13 +1,19 @@
+
+
 from pathlib import Path
+from datetime import datetime
 import logging
 import shutil
+import csv
 import pandas as pd
+from upload_files_to_s3 import upload_to_s3
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
 
 EXPECTED_CUSTOMERS_COLUMNS = [
     "customer_id",
@@ -100,6 +106,48 @@ def validate_schema(df: pd.DataFrame, expected_columns: list[str]) -> tuple[bool
     return True, "Schema validation passed"
 
 
+def validate_data(df: pd.DataFrame, file_name: str) -> tuple[bool, str]:
+    file_name = file_name.lower()
+
+    if "customers" in file_name:
+        if df["customer_id"].isnull().any():
+            return False, "customer_id has null values"
+        if df["customer_unique_id"].isnull().any():
+            return False, "customer_unique_id has null values"
+        if df["customer_id"].duplicated().any():
+            return False, "duplicate customer_id found"
+
+    elif "orders" in file_name and "order_items" not in file_name:
+        if df["order_id"].isnull().any():
+            return False, "order_id has null values"
+        if df["customer_id"].isnull().any():
+            return False, "customer_id has null values"
+        if df["order_id"].duplicated().any():
+            return False, "duplicate order_id found"
+
+    elif "order_items" in file_name:
+        if df["order_id"].isnull().any():
+            return False, "order_id has null values"
+        if df["order_item_id"].isnull().any():
+            return False, "order_item_id has null values"
+        if df[["order_id", "order_item_id"]].duplicated().any():
+            return False, "duplicate order_id + order_item_id found"
+        if (df["price"] < 0).any():
+            return False, "price has negative values"
+        if (df["freight_value"] < 0).any():
+            return False, "freight_value has negative values"
+
+    elif "payments" in file_name:
+        if df["order_id"].isnull().any():
+            return False, "order_id has null values"
+        if df["payment_value"].isnull().any():
+            return False, "payment_value has null values"
+        if (df["payment_value"] < 0).any():
+            return False, "payment_value has negative values"
+
+    return True, "Data validation passed"
+
+
 def move_file(file: Path, target_folder: str):
     target_path = Path(target_folder)
     target_path.mkdir(parents=True, exist_ok=True)
@@ -110,7 +158,48 @@ def move_file(file: Path, target_folder: str):
     return destination
 
 
-def process_files(incoming_folder: str, processed_folder: str, rejected_folder: str):
+def write_audit_log(
+    audit_file: str,
+    file_name: str,
+    status: str,
+    reason: str,
+    destination: str,
+    row_count: int
+):
+    audit_path = Path(audit_file)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_exists = audit_path.exists()
+
+    with open(audit_path, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "timestamp",
+                "file_name",
+                "status",
+                "reason",
+                "destination",
+                "row_count",
+            ])
+
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            file_name,
+            status,
+            reason,
+            destination,
+            row_count,
+        ])
+
+
+def process_files(
+    incoming_folder: str,
+    processed_folder: str,
+    rejected_folder: str,
+    audit_file: str
+):
     valid_files = []
     invalid_files = []
 
@@ -121,45 +210,152 @@ def process_files(incoming_folder: str, processed_folder: str, rejected_folder: 
 
         if expected_columns is None:
             message = "Unknown file type"
-            logger.error("INVALID file: %s - %s", file.name, message)
-
             destination = move_file(file, rejected_folder)
+
+            logger.error("INVALID file: %s - %s", file.name, message)
             invalid_files.append((file.name, message, str(destination)))
+
+            write_audit_log(
+                audit_file,
+                file.name,
+                "INVALID",
+                message,
+                str(destination),
+                0,
+            )
             continue
 
         try:
-            df = pd.read_csv(file)
+            total_rows = 0
+            is_first_chunk = True
+            file_invalid = False
 
-            is_valid, message = validate_schema(df, expected_columns)
+            for chunk in pd.read_csv(file, chunksize=10000):
+                total_rows += len(chunk)
 
-            if is_valid:
-                destination = move_file(file, processed_folder)
-                logger.info("VALID file: %s - moved to %s", file.name, destination)
-                valid_files.append((file.name, str(destination)))
-            else:
-                destination = move_file(file, rejected_folder)
-                logger.error("INVALID file: %s - %s", file.name, message)
-                invalid_files.append((file.name, message, str(destination)))
+                if is_first_chunk:
+                    is_schema_valid, schema_message = validate_schema(
+                        chunk,
+                        expected_columns
+                    )
+
+                    if not is_schema_valid:
+                        destination = move_file(file, rejected_folder)
+
+                        logger.error(
+                            "INVALID schema: %s - %s",
+                            file.name,
+                            schema_message
+                        )
+
+                        invalid_files.append(
+                            (file.name, schema_message, str(destination))
+                        )
+
+                        write_audit_log(
+                            audit_file,
+                            file.name,
+                            "INVALID",
+                            schema_message,
+                            str(destination),
+                            total_rows,
+                        )
+
+                        file_invalid = True
+                        break
+
+                    is_first_chunk = False
+
+                is_data_valid, data_message = validate_data(chunk, file.name)
+
+                if not is_data_valid:
+                    destination = move_file(file, rejected_folder)
+
+                    logger.error(
+                        "INVALID data: %s - %s",
+                        file.name,
+                        data_message
+                    )
+
+                    invalid_files.append(
+                        (file.name, data_message, str(destination))
+                    )
+
+                    write_audit_log(
+                        audit_file,
+                        file.name,
+                        "INVALID",
+                        data_message,
+                        str(destination),
+                        total_rows,
+                    )
+
+                    file_invalid = True
+                    break
+
+            if file_invalid:
+                continue
+
+            destination = move_file(file, processed_folder)
+
+            bucket_name = "shaik-olist-bucket"
+            s3_key = f"bronze/{file.name}"
+
+            upload_to_s3(destination, bucket_name, s3_key)
+
+            logger.info(
+                "VALID file: %s - moved to %s and uploaded to s3://%s/%s | rows=%s",
+                file.name,
+                destination,
+                bucket_name,
+                s3_key,
+                total_rows,
+            )
+
+            valid_files.append((file.name, str(destination)))
+
+            write_audit_log(
+                audit_file,
+                file.name,
+                "VALID",
+                "All validations passed",
+                str(destination),
+                total_rows,
+            )
 
         except Exception as e:
             message = str(e)
             logger.exception("FAILED to process file: %s", file.name)
 
-            destination = move_file(file, rejected_folder)
+            try:
+                destination = move_file(file, rejected_folder)
+            except Exception:
+                destination = "MOVE_FAILED"
+
             invalid_files.append((file.name, message, str(destination)))
 
-    return valid_files, invalid_files
+            write_audit_log(
+                audit_file,
+                file.name,
+                "INVALID",
+                message,
+                str(destination),
+                0,
+            )
 
+    return valid_files, invalid_files
 
 if __name__ == "__main__":
     incoming_folder = "data/incoming"
     processed_folder = "data/processed"
     rejected_folder = "data/rejected"
+    audit_file = "data/audit/audit_log.csv"
 
     valid_files, invalid_files = process_files(
         incoming_folder,
         processed_folder,
-        rejected_folder
+        rejected_folder,
+        audit_file,
     )
 
     print("\nValid files:")
@@ -169,3 +365,4 @@ if __name__ == "__main__":
     print("\nInvalid files:")
     for file_name, reason, destination in invalid_files:
         print(f"- {file_name} -> {destination} | Reason: {reason}")
+        
