@@ -1,3 +1,6 @@
 venv/
 data/
-process.md
+process.md__pycache__/
+*.pyc
+venv/
+.env

@@ -1,5 +1,4 @@
 
-
 from pathlib import Path
 from datetime import datetime
 import logging
@@ -153,8 +152,12 @@ def move_file(file: Path, target_folder: str):
     target_path.mkdir(parents=True, exist_ok=True)
 
     destination = target_path / file.name
-    shutil.move(str(file), str(destination))
 
+    if destination.exists():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = target_path / f"{file.stem}_{timestamp}{file.suffix}"
+
+    shutil.move(str(file), str(destination))
     return destination
 
 
@@ -194,6 +197,25 @@ def write_audit_log(
         ])
 
 
+def reject_file(file: Path, rejected_folder: str, reason: str, audit_file: str, row_count: int):
+    try:
+        destination = move_file(file, rejected_folder)
+    except Exception as e:
+        logger.exception("Failed to move file to rejected folder: %s", file.name)
+        destination = f"MOVE_FAILED: {e}"
+
+    write_audit_log(
+        audit_file=audit_file,
+        file_name=file.name,
+        status="INVALID",
+        reason=reason,
+        destination=str(destination),
+        row_count=row_count,
+    )
+
+    return destination
+
+
 def process_files(
     incoming_folder: str,
     processed_folder: str,
@@ -210,19 +232,10 @@ def process_files(
 
         if expected_columns is None:
             message = "Unknown file type"
-            destination = move_file(file, rejected_folder)
+            destination = reject_file(file, rejected_folder, message, audit_file, 0)
 
             logger.error("INVALID file: %s - %s", file.name, message)
             invalid_files.append((file.name, message, str(destination)))
-
-            write_audit_log(
-                audit_file,
-                file.name,
-                "INVALID",
-                message,
-                str(destination),
-                0,
-            )
             continue
 
         try:
@@ -240,7 +253,13 @@ def process_files(
                     )
 
                     if not is_schema_valid:
-                        destination = move_file(file, rejected_folder)
+                        destination = reject_file(
+                            file,
+                            rejected_folder,
+                            schema_message,
+                            audit_file,
+                            total_rows,
+                        )
 
                         logger.error(
                             "INVALID schema: %s - %s",
@@ -252,15 +271,6 @@ def process_files(
                             (file.name, schema_message, str(destination))
                         )
 
-                        write_audit_log(
-                            audit_file,
-                            file.name,
-                            "INVALID",
-                            schema_message,
-                            str(destination),
-                            total_rows,
-                        )
-
                         file_invalid = True
                         break
 
@@ -269,7 +279,13 @@ def process_files(
                 is_data_valid, data_message = validate_data(chunk, file.name)
 
                 if not is_data_valid:
-                    destination = move_file(file, rejected_folder)
+                    destination = reject_file(
+                        file,
+                        rejected_folder,
+                        data_message,
+                        audit_file,
+                        total_rows,
+                    )
 
                     logger.error(
                         "INVALID data: %s - %s",
@@ -281,69 +297,69 @@ def process_files(
                         (file.name, data_message, str(destination))
                     )
 
-                    write_audit_log(
-                        audit_file,
-                        file.name,
-                        "INVALID",
-                        data_message,
-                        str(destination),
-                        total_rows,
-                    )
-
                     file_invalid = True
                     break
 
             if file_invalid:
                 continue
 
-            destination = move_file(file, processed_folder)
-
             bucket_name = "shaik-olist-bucket"
             s3_key = f"bronze/{file.name}"
 
-            upload_to_s3(destination, bucket_name, s3_key)
+            try:
+                upload_to_s3(file, bucket_name, s3_key)
+                destination = move_file(file, processed_folder)
 
-            logger.info(
-                "VALID file: %s - moved to %s and uploaded to s3://%s/%s | rows=%s",
-                file.name,
-                destination,
-                bucket_name,
-                s3_key,
-                total_rows,
-            )
+                logger.info(
+                    "VALID file: %s - uploaded to s3://%s/%s and moved to %s | rows=%s",
+                    file.name,
+                    bucket_name,
+                    s3_key,
+                    destination,
+                    total_rows,
+                )
 
-            valid_files.append((file.name, str(destination)))
+                valid_files.append((file.name, str(destination)))
 
-            write_audit_log(
-                audit_file,
-                file.name,
-                "VALID",
-                "All validations passed",
-                str(destination),
-                total_rows,
-            )
+                write_audit_log(
+                    audit_file,
+                    file.name,
+                    "VALID",
+                    "All validations passed and uploaded to S3",
+                    str(destination),
+                    total_rows,
+                )
+
+            except Exception as e:
+                message = f"S3 upload or processed move failed: {e}"
+                logger.exception("FAILED after validation: %s", file.name)
+
+                destination = reject_file(
+                    file,
+                    rejected_folder,
+                    message,
+                    audit_file,
+                    total_rows,
+                )
+
+                invalid_files.append((file.name, message, str(destination)))
 
         except Exception as e:
             message = str(e)
             logger.exception("FAILED to process file: %s", file.name)
 
-            try:
-                destination = move_file(file, rejected_folder)
-            except Exception:
-                destination = "MOVE_FAILED"
-
-            invalid_files.append((file.name, message, str(destination)))
-
-            write_audit_log(
-                audit_file,
-                file.name,
-                "INVALID",
+            destination = reject_file(
+                file,
+                rejected_folder,
                 message,
-                str(destination),
+                audit_file,
                 0,
             )
 
+            invalid_files.append((file.name, message, str(destination)))
+
     return valid_files, invalid_files
+
 
 if __name__ == "__main__":
     incoming_folder = "data/incoming"
@@ -365,4 +381,3 @@ if __name__ == "__main__":
     print("\nInvalid files:")
     for file_name, reason, destination in invalid_files:
         print(f"- {file_name} -> {destination} | Reason: {reason}")
-        
