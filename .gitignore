@@ -4,3 +4,5 @@ process.md__pycache__/
 *.pyc
 venv/
 .env
+project_info/
+pract.py
